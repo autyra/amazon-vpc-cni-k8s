@@ -801,8 +801,10 @@ func (stats *DataStoreStats) String() string {
 		stats.TotalIPs, stats.TotalPrefixes, stats.AssignedIPs, stats.CooldownIPs)
 }
 
+// AvailableAddresses returns the number of IPs that are available for assignment to a pod.
+// IPs in cooldown are not available for assignment until their cooldown period expires.
 func (stats *DataStoreStats) AvailableAddresses() int {
-	return stats.TotalIPs - stats.AssignedIPs
+	return stats.TotalIPs - stats.AssignedIPs - stats.CooldownIPs
 }
 
 // GetIPStats returns DataStoreStats for addressFamily
@@ -865,7 +867,9 @@ func (ds *DataStore) isRequiredForWarmIPTarget(warmIPTarget int, eni *ENI) bool 
 		if other.ID != eni.ID {
 			for _, otherPrefixes := range other.AvailableIPv4Cidrs {
 				if (ds.isPDEnabled && otherPrefixes.IsPrefix) || (!ds.isPDEnabled && !otherPrefixes.IsPrefix) {
-					otherWarmIPs += otherPrefixes.Size() - otherPrefixes.AssignedIPAddressesInCidr()
+					cidrStats := otherPrefixes.GetIPStatsFromCidr(ds.ipCooldownPeriod)
+					// IPs in cooldown are not warm, since they cannot be assigned to pods until their cooldown expires
+					otherWarmIPs += otherPrefixes.Size() - cidrStats.AssignedIPs - cidrStats.CooldownIPs
 				}
 			}
 		}
@@ -906,7 +910,10 @@ func (ds *DataStore) isRequiredForWarmPrefixTarget(warmPrefixTarget int, eni *EN
 	for _, other := range ds.eniPool {
 		if other.ID != eni.ID {
 			for _, otherPrefixes := range other.AvailableIPv4Cidrs {
-				if otherPrefixes.AssignedIPAddressesInCidr() == 0 {
+				cidrStats := otherPrefixes.GetIPStatsFromCidr(ds.ipCooldownPeriod)
+				// A prefix with IPs in cooldown is not free, since those IPs cannot be assigned to
+				// pods until their cooldown expires
+				if (cidrStats.AssignedIPs + cidrStats.CooldownIPs) == 0 {
 					freePrefixes++
 				}
 			}
@@ -1297,7 +1304,7 @@ func (ds *DataStore) GetENICIDRs(eniID string) ([]string, []string, error) {
 	return ipPool, prefixPool, nil
 }
 
-// GetFreePrefixes return free prefixes
+// GetFreePrefixes returns the number of prefixes that have no assigned IPs and no IPs in cooldown
 func (ds *DataStore) GetFreePrefixes() int {
 	ds.lock.Lock()
 	defer ds.lock.Unlock()
@@ -1305,8 +1312,13 @@ func (ds *DataStore) GetFreePrefixes() int {
 	freePrefixes := 0
 	for _, other := range ds.eniPool {
 		for _, otherPrefixes := range other.AvailableIPv4Cidrs {
-			if otherPrefixes.IsPrefix && otherPrefixes.AssignedIPAddressesInCidr() == 0 {
-				freePrefixes++
+			if otherPrefixes.IsPrefix {
+				cidrStats := otherPrefixes.GetIPStatsFromCidr(ds.ipCooldownPeriod)
+				// A prefix with IPs in cooldown is not free, since those IPs cannot be assigned to
+				// pods until their cooldown expires, and the prefix cannot be returned to EC2.
+				if cidrStats.AssignedIPs == 0 && cidrStats.CooldownIPs == 0 {
+					freePrefixes++
+				}
 			}
 		}
 	}
@@ -1424,7 +1436,10 @@ func (ds *DataStore) FindFreeableCidrs(eniID string) []CidrInfo {
 
 	var freeable []CidrInfo
 	for _, assignedaddr := range eni.AvailableIPv4Cidrs {
-		if assignedaddr.AssignedIPAddressesInCidr() == 0 {
+		cidrStats := assignedaddr.GetIPStatsFromCidr(ds.ipCooldownPeriod)
+		// Cidrs with IPs in cooldown are not freeable, as the cooldown period guards against
+		// traffic to a recently deleted pod reaching a new pod that is assigned the same IP.
+		if cidrStats.AssignedIPs == 0 && cidrStats.CooldownIPs == 0 {
 			tempFreeable := CidrInfo{
 				Cidr:          assignedaddr.Cidr,
 				IPAddresses:   nil,
